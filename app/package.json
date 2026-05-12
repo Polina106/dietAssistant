@@ -1,0 +1,12 @@
+{
+  "name": "meal-planner-app",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Фронт лежит в static/; полное приложение запускается через FastAPI (uvicorn), не через serve.",
+  "scripts": {
+    "dev": "cd .. && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000",
+    "start": "npm run dev",
+    "serve-static": "npx serve static --listen 3000"
+  },
+  "license": "ISC"
+}
