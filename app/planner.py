@@ -1,239 +1,169 @@
+import logging
+
 import numpy as np
 import pandas as pd
-
+from ortools.linear_solver import pywraplp
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
-from ortools.linear_solver import pywraplp
-from IPython.display import display
+
+from app.config import CUISINE_FEATURES, PRODUCT_FEATURES, ALLERGEN_DISH_NAMES
+
+logger = logging.getLogger(__name__)
 
 
 class MealPlanner:
 
-    def __init__(self, recipes_df: pd.DataFrame, allergens: list,
-                 cont_features: list, product_features: list):
-
+    def __init__(self, recipes_df: pd.DataFrame):
         self.recipes_df = recipes_df
-        self.allergens = allergens
-        self.cont_features = cont_features
-        self.product_features = product_features
+        self.allergens = ALLERGEN_DISH_NAMES
+        self.cont_features = CUISINE_FEATURES
+        self.product_features = PRODUCT_FEATURES
 
-    # 1. Фильтрация
-    def filter_recipes(self, user_row):
+    def filter_recipes(self, user_row: pd.Series) -> pd.DataFrame:
+        df = self.recipes_df.copy()
 
-        recipes_df = self.recipes_df.copy()
-
-        allergen_mask = np.ones(len(recipes_df), dtype=bool)
-
+        allergen_mask = np.ones(len(df), dtype=bool)
         for allergen in self.allergens:
-            if user_row.get(allergen, 0) == 1:
-                allergen_mask &= (recipes_df[allergen] == 0)
+            if user_row.get(allergen, 0) == 1 and allergen in df.columns:
+                allergen_mask &= (df[allergen] == 0)
 
-        time_mask = (
-            recipes_df['ready_in_minutes']
-            <= user_row['пассивное_время_мин'] * 1.25
-        )
+        passive_limit = user_row.get("пассивное_время_мин", 9999) * 1.25
+        active_limit = user_row.get("активное_время_готовки_мин", 9999) * 1.25
 
-        time_mask_kitchen = (
-            recipes_df['kitchen_time_in_minutes']
-            <= user_row['активное_время_готовки_мин'] * 1.25
-        )
+        time_mask = df["ready_in_minutes"] <= passive_limit
+        kitchen_mask = df["kitchen_time_minutes"] <= active_limit
 
-        return recipes_df[allergen_mask & time_mask & time_mask_kitchen]
+        return df[allergen_mask & time_mask & kitchen_mask]
 
-
-    # 2. Считаем косинусное сходство
-    def rank_recipes(self, user_row, filtered_recipes):
+    def rank_recipes(self, user_row: pd.Series, filtered: pd.DataFrame) -> pd.DataFrame:
+        if filtered.empty:
+            return filtered
 
         scaler = MinMaxScaler()
 
-        recipes_cont_scaled = scaler.fit_transform(
-            filtered_recipes[self.cont_features]
-        )
+        recipes_cont = filtered[self.cont_features].fillna(0).values
+        if recipes_cont.max() == recipes_cont.min():
+            recipes_cont_scaled = recipes_cont
+            user_cont_scaled = np.array([[user_row.get(f, 0) for f in self.cont_features]])
+        else:
+            recipes_cont_scaled = scaler.fit_transform(recipes_cont)
+            user_cont_scaled = scaler.transform(
+                np.array([[user_row.get(f, 0) for f in self.cont_features]])
+            )
 
-        user_cont_vector = scaler.transform(
-            user_row[self.cont_features].values.reshape(1, -1)
-        )
+        recipes_prod = filtered[self.product_features].fillna(0).astype(float).values
+        user_prod = np.array([[user_row.get(f, 0.5) for f in self.product_features]])
 
-        recipes_prod = filtered_recipes[self.product_features].astype(float).values
-        user_prod_vector = (
-            user_row[self.product_features].values / 10
-        ).reshape(1, -1)
+        recipes_vec = np.hstack([recipes_cont_scaled, recipes_prod])
+        user_vec = np.hstack([user_cont_scaled, user_prod])
 
-        recipes_vectors = np.hstack([recipes_cont_scaled, recipes_prod])
-        user_vector = np.hstack([user_cont_vector, user_prod_vector])
+        cos_sim = cosine_similarity(user_vec, recipes_vec)[0]
 
-        cos_sim = cosine_similarity(user_vector, recipes_vectors)[0]
+        ranked = filtered.copy()
+        ranked["cos_sim"] = cos_sim
+        ranked = ranked.sort_values("cos_sim", ascending=False)
 
-        ranked = filtered_recipes.copy()
-        ranked['cos_sim'] = cos_sim
+        logger.debug("Top-5 by cosine similarity:\n%s",
+                     ranked[["id", "title", "cos_sim"]].head(5).to_string())
+        return ranked
 
-        ranked['calories'] = ranked['calories'] * 3
-
-        display(ranked.sort_values('cos_sim', ascending=False)[:10])
-
-        return ranked.sort_values('cos_sim', ascending=False)
-
-
-    # 3. Оптимизатор
-    def optimize_meals(self, filtered_recipes_df, target_calories, tolerance=0.1):
-        """
-        Выбирает оптимальный набор блюд (завтрак, обед, ужин, десерт).
-        """
-        solver = pywraplp.Solver.CreateSolver('CBC')
+    def optimize_meals(self, ranked: pd.DataFrame, target_calories: float, tolerance: float = 0.1):
+        solver = pywraplp.Solver.CreateSolver("CBC")
         if not solver:
-            print('Solver не найден.')
+            logger.error("OR-Tools solver not found")
             return None
 
-        recipes = filtered_recipes_df.to_dict('records')
+        recipes = ranked.to_dict("records")
         n = len(recipes)
 
-        x = [solver.IntVar(0, 1, f'recipe_{i}') for i in range(n)]
+        x = [solver.IntVar(0, 1, f"r_{i}") for i in range(n)]
 
-        # --- Правильное распределение категорий по приемам пищи ---
-        breakfast_indices = [
-            i for i in range(n)
-            if recipes[i]['category_lvl1'] in ['Закуски', 'Вторые блюда']
-        ]
+        breakfast = [i for i in range(n) if recipes[i]["mealType"] == "BREAKFAST"]
+        lunch = [i for i in range(n) if recipes[i]["mealType"] == "LUNCH"]
+        dinner = [i for i in range(n) if recipes[i]["mealType"] == "DINNER"]
 
-        lunch_indices = [
-            i for i in range(n)
-            if recipes[i]['category_lvl1'] in ['Первые блюда', 'Вторые блюда', 'Салаты', 'Рецепты с любимыми продуктами']
-        ]
+        meal_slots = {"BREAKFAST": breakfast, "LUNCH": lunch, "DINNER": dinner}
+        available_slots = {k: v for k, v in meal_slots.items() if v}
 
-        dinner_indices = [
-            i for i in range(n)
-            if recipes[i]['category_lvl1'] in ['Вторые блюда', 'Салаты', 'Закуски', 'Рецепты с любимыми продуктами', 'Гарниры']
-        ]
+        if not available_slots:
+            logger.warning("No recipes available for any meal slot")
+            return None
 
-        dessert_indices = [
-            i for i in range(n)
-            if recipes[i]['category_lvl1'] in ['Десерты', 'Выпечка']
-        ]
+        cal_expr = solver.Sum([recipes[i]["calories"] * x[i] for i in range(n)])
+        solver.Add(cal_expr >= target_calories * (1 - tolerance))
+        solver.Add(cal_expr <= target_calories * (1 + tolerance))
 
-
-        # 1. Калорийность
-        calories_expr = solver.Sum([recipes[i]['calories'] * x[i] for i in range(n)])
-        solver.Add(calories_expr >= target_calories * (1 - tolerance))
-        solver.Add(calories_expr <= target_calories * (1 + tolerance))
-
-        # 2. Ровно по одному блюду на каждый прием пищи
-        # Проверяем, что для каждого типа есть хотя бы один рецепт
-        meal_types = {
-            'завтрак': breakfast_indices,
-            'обед': lunch_indices,
-            'ужин': dinner_indices,
-            'десерт': dessert_indices
-        }
-
-        for meal_name, indices in meal_types.items():
-            if not indices:
-                print(f"Предупреждение: Нет рецептов для '{meal_name}' в доступном списке!")
-                continue
+        for slot_name, indices in available_slots.items():
             solver.Add(solver.Sum([x[i] for i in indices]) == 1)
 
-        # 3. Дополнительное ограничение: всего должно быть выбрано ровно 4 блюда
-        # (на случай, если какой-то тип отсутствует)
-        solver.Add(solver.Sum(x) == 4)
+        solver.Add(solver.Sum(x) == len(available_slots))
 
-        objective = solver.Objective()
+        obj = solver.Objective()
         for i in range(n):
-            objective.SetCoefficient(x[i], recipes[i]['cos_sim'])
-        objective.SetMaximization()
+            obj.SetCoefficient(x[i], recipes[i]["cos_sim"])
+        obj.SetMaximization()
 
         status = solver.Solve()
 
-        if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
-            print('Решение найдено!')
-            print(f'Целевая калорийность: {target_calories} ± {tolerance*100}%')
-
-            selected_ids = []
-            total_calories = 0
-            total_score = 0
-            meal_count = {'завтрак': 0, 'обед': 0, 'ужин': 0, 'десерт': 0}
-
-            print("\nОптимальное меню на день:")
-            print("-" * 50)
-
-            for i in range(n):
-                if x[i].solution_value() > 0.5:
-                    recipe = recipes[i]
-                    selected_ids.append(recipe['id'])
-                    total_calories += recipe['calories']
-                    total_score += recipe['cos_sim']
-
-                    # Определяем, к какому приему пищи относится блюдо
-                    if i in breakfast_indices:
-                        meal_type = "ЗАВТРАК"
-                        meal_count['завтрак'] += 1
-                    elif i in lunch_indices:
-                        meal_type = "ОБЕД"
-                        meal_count['обед'] += 1
-                    elif i in dinner_indices:
-                        meal_type = "УЖИН"
-                        meal_count['ужин'] += 1
-                    elif i in dessert_indices:
-                        meal_type = "ДЕСЕРТ"
-                        meal_count['десерт'] += 1
-                    else:
-                        meal_type = "ДРУГОЕ"
-
-                    print(f"{meal_type:8}: {recipe.get('title', f'ID:{recipe['id']}')}")
-                    print(f"          id: {recipe['id']}")
-                    print(f"          Категория: {recipe['category_lvl1']}")
-                    print(f"          Калории: {recipe['calories']} ккал")
-                    print(f"          Релевантность: {recipe['cos_sim']:.3f}")
-                    print()
-
-            print("-" * 50)
-            print(f" ИТОГО:")
-            print(f"   Калории: {total_calories} ккал (цель: {target_calories} ккал)")
-            print(f"   Отклонение: {((total_calories/target_calories)-1)*100:.1f}%")
-            print(f"   Суммарная релевантность: {total_score:.3f}")
-            print(f"   Состав меню: {meal_count}")
-
-            return filtered_recipes_df[filtered_recipes_df['id'].isin(selected_ids)]
-
-        else:
-            print('Не удалось найти оптимальное решение.')
-            print('\nВозможные причины:')
-            print('1. Слишком жесткие ограничения по калорийности')
-            print('2. Нет подходящих рецептов для какого-то приема пищи')
-
-            # Диагностика
-            print('\n Доступные рецепты по категориям:')
-            print(filtered_recipes_df['category_lvl1'].value_counts())
-
+        if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+            logger.info(
+                "No solution found (tolerance=%.0f%%). Category distribution: %s",
+                tolerance * 100,
+                ranked["mealType"].value_counts().to_dict(),
+            )
             return None
 
+        selected_ids = [
+            recipes[i]["id"] for i in range(n) if x[i].solution_value() > 0.5
+        ]
+        total_cal = sum(recipes[i]["calories"] for i in range(n) if x[i].solution_value() > 0.5)
+        logger.info(
+            "Plan found: %d dishes, %.0f kcal (target %.0f, deviation %.1f%%)",
+            len(selected_ids), total_cal, target_calories,
+            (total_cal / target_calories - 1) * 100 if target_calories else 0,
+        )
+        return ranked[ranked["id"].isin(selected_ids)]
 
-    # Собираем pipeline
-    def plan_day(self, user_dict, exclude_recipe_ids=None):
-
+    def plan_day(self, user_dict: dict, exclude_recipe_ids: list[int] | None = None) -> list[dict]:
         user_row = pd.Series(user_dict)
 
         filtered = self.filter_recipes(user_row)
-
         if filtered.empty:
+            logger.warning("No recipes passed filters")
             return []
 
         ranked = self.rank_recipes(user_row, filtered)
 
         if exclude_recipe_ids:
-            exclude_set = set(exclude_recipe_ids)
-            ranked = ranked[~ranked["id"].isin(exclude_set)]
+            ranked = ranked[~ranked["id"].isin(set(exclude_recipe_ids))]
         if ranked.empty:
+            logger.warning("No recipes left after exclusions")
             return []
 
-        tolerances = [0.05, 0.07, 0.1, 0.2, 0.3, 0.5, 0.7]
-
-        for tol in tolerances:
-            result = self.optimize_meals(
-                ranked,
-                target_calories=user_row["target_calories"],
-                tolerance=tol,
-            )
-
+        for tol in [0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7]:
+            result = self.optimize_meals(ranked, target_calories=user_dict["target_calories"], tolerance=tol)
             if result is not None:
                 return result.to_dict(orient="records")
 
+        logger.warning("Optimizer failed for all tolerances")
         return []
+
+    def find_replacement(
+        self,
+        user_dict: dict,
+        meal_type: str,
+        exclude_ids: list[int],
+    ) -> dict | None:
+        user_row = pd.Series(user_dict)
+        filtered = self.filter_recipes(user_row)
+        filtered = filtered[filtered["mealType"] == meal_type]
+        filtered = filtered[~filtered["id"].isin(set(exclude_ids))]
+
+        if filtered.empty:
+            return None
+
+        ranked = self.rank_recipes(user_row, filtered)
+        if ranked.empty:
+            return None
+
+        return ranked.iloc[0].to_dict()

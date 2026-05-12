@@ -47,3 +47,5 @@ poetry.toml
 .vscode/
 
 .ruff_cache/
+
+.idea
