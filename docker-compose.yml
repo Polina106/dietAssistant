@@ -1,0 +1,20 @@
+services:
+  diet-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      AUTH_URL: ${AUTH_URL:-http://auth-service:8080}
+      USER_URL: ${USER_URL:-http://user-service:8080}
+      MEAL_URL: ${MEAL_URL:-http://meal-service:8080}
+      MEAL_PLAN_URL: ${MEAL_PLAN_URL:-http://meal-plan-service:8080}
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-kafka:9092}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-default-service-secret-key}
+    networks:
+      - main
+
+networks:
+  main:
+    name: personal-meal-planner_default
+    external: true
