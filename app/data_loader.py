@@ -64,7 +64,7 @@ def build_dataframe(dishes: list[dict]) -> pd.DataFrame:
         row = {
             "id":                    dish["id"],
             "title":                 dish.get("title", ""),
-            "calories":              float(dish.get("calories") or 0),
+            "calories":              float(dish.get("calories") or 0) * 3,  # per-100g → 300g portion
             "mealType":              dish.get("mealType", ""),
             "cuisine":               dish.get("cuisine", ""),
             "ready_in_minutes":      _parse_minutes(dish.get("readyIn")),

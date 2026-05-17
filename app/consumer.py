@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import NoBrokersAvailable
@@ -149,12 +150,7 @@ def _handle_replace(cmd: dict, producer: KafkaProducer) -> None:
         _publish_job_updated(producer, job_id, "FAILED", str(e))
 
 
-def start_consumer() -> None:
-    producer = KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
-    )
-
+def _run_consumer_once(producer: KafkaProducer) -> None:
     consumer = KafkaConsumer(
         TOPIC_GENERATE_COMMAND,
         TOPIC_REPLACE_COMMAND,
@@ -164,15 +160,34 @@ def start_consumer() -> None:
         auto_offset_reset="earliest",
         enable_auto_commit=True,
     )
-
     logger.info("Kafka consumer started, listening on topics: %s, %s",
                 TOPIC_GENERATE_COMMAND, TOPIC_REPLACE_COMMAND)
-
-    for message in consumer:
+    try:
+        for message in consumer:
+            try:
+                if message.topic == TOPIC_GENERATE_COMMAND:
+                    _handle_generate(message.value, producer)
+                elif message.topic == TOPIC_REPLACE_COMMAND:
+                    _handle_replace(message.value, producer)
+            except Exception:
+                logger.exception("Unexpected error processing message from topic %s", message.topic)
+    finally:
         try:
-            if message.topic == TOPIC_GENERATE_COMMAND:
-                _handle_generate(message.value, producer)
-            elif message.topic == TOPIC_REPLACE_COMMAND:
-                _handle_replace(message.value, producer)
+            consumer.close()
         except Exception:
-            logger.exception("Unexpected error processing message from topic %s", message.topic)
+            pass
+
+
+def start_consumer() -> None:
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+    )
+
+    retry_delay = 5
+    while True:
+        try:
+            _run_consumer_once(producer)
+        except Exception:
+            logger.exception("Kafka consumer crashed, restarting in %ds", retry_delay)
+            time.sleep(retry_delay)

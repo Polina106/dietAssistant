@@ -1,11 +1,11 @@
 import os
 
-AUTH_URL = os.environ.get("AUTH_URL", "http://localhost:8081")
-USER_URL = os.environ.get("USER_URL", "http://localhost:8082")
-MEAL_URL = os.environ.get("MEAL_URL", "http://localhost:8083")
-MEAL_PLAN_URL = os.environ.get("MEAL_PLAN_URL", "http://localhost:8084")
+AUTH_URL = os.environ.get("AUTH_URL", "http://auth-service:8080")
+USER_URL = os.environ.get("USER_URL", "http://user-service:8080")
+MEAL_URL = os.environ.get("MEAL_URL", "http://meal-service:8080")
+MEAL_PLAN_URL = os.environ.get("MEAL_PLAN_URL", "http://meal-plan-service:8080")
 
-KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
+KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "default-service-secret-key")
 
 TOPIC_GENERATE_COMMAND = "generate.mealplan.command"
