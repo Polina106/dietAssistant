@@ -159,6 +159,10 @@ def _run_consumer_once(producer: KafkaProducer) -> None:
         group_id="diet-assistant",
         auto_offset_reset="earliest",
         enable_auto_commit=True,
+        consumer_timeout_ms=60_000,
+        metadata_max_age_ms=15_000,
+        reconnect_backoff_ms=500,
+        reconnect_backoff_max_ms=5_000,
     )
     logger.info("Kafka consumer started, listening on topics: %s, %s",
                 TOPIC_GENERATE_COMMAND, TOPIC_REPLACE_COMMAND)
@@ -171,6 +175,7 @@ def _run_consumer_once(producer: KafkaProducer) -> None:
                     _handle_replace(message.value, producer)
             except Exception:
                 logger.exception("Unexpected error processing message from topic %s", message.topic)
+        logger.info("Consumer idle timeout reached, restarting to refresh connection")
     finally:
         try:
             consumer.close()
