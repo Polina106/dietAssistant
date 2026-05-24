@@ -1,0 +1,36 @@
+[project]
+name = "personal-diet-assistant"
+version = "0.1.0"
+description = "Персональный ассистент для подбора рациона питания при выбранной стратегии (снижение веса, набор массы, поддержание веса)."
+requires-python = ">=3.10"
+authors = [
+    {name = "Polina Shpineva", email = "polina.shpineva@gmail.com"},
+    {name = "Dmitry Samorodov", email = "dmitry.samorodov@gmail.com"}
+]
+
+[tool.ruff]
+select = [
+    "E",  
+    "W",  
+    "F",  
+    "I",  
+    "B",  
+    "C4", 
+    "UP", 
+]
+
+ignore = [
+    "E501",  
+    "B008",  
+]
+
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+indent-width = 4
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  

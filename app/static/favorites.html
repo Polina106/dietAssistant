@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Избранное</title>
+  <base href="/static/" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1>Избранное</h1>
+      <p>Рецепты, которые вы добавили в избранное.</p>
+      <p style="margin-top:8px;font-size:13px;">
+        <a href="/plan" class="nav-link">Мой рацион</a>
+        <span style="color:var(--text-muted);margin:0 6px;">·</span>
+        <a href="/viewed" class="nav-link">Просмотренные</a>
+        <span style="color:var(--text-muted);margin:0 6px;">·</span>
+        <a href="/" class="nav-link">Анкета</a>
+      </p>
+    </header>
+
+    <main class="layout layout--single">
+      <section class="card results-card">
+        <h2>Список избранного</h2>
+        <div id="favorites-list" class="results-list">
+          <!-- заполняется favorites.js -->
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="favorites.js"></script>
+</body>
+
+</html>
