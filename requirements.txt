@@ -1,3 +1,4 @@
+openai>=1.30.0
 fastapi==0.133.1
 uvicorn==0.41.0
 pydantic==2.12.5
@@ -6,4 +7,3 @@ numpy==2.4.2
 pandas==3.0.1
 scikit-learn==1.8.0
 ortools==9.15.6755
-openai>=1.30.0

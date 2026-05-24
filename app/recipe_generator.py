@@ -11,7 +11,6 @@ from app.config import (
     PRODUCT_FEATURES,
     PRODUCT_KEYWORDS,
     GROK_API_KEY,
-    GROK_BASE_URL,
     GROK_MODEL,
 )
 
@@ -102,7 +101,10 @@ class RecipeGenerator:
     """Generates recipes via the Grok (xAI) API as a fallback when the optimizer fails."""
 
     def __init__(self) -> None:
-        self.client = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
+        self.client = OpenAI(
+            api_key=GROK_API_KEY,
+            base_url="https://api.mistral.ai/v1",
+        )
         self.model = GROK_MODEL
         self._ensure_storage()
 

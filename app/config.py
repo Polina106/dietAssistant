@@ -7,13 +7,11 @@ MEAL_PLAN_URL = os.environ.get("MEAL_PLAN_URL", "http://meal-plan-service:8080")
 
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "default-service-secret-key")
 
-# LLM API for recipe generation (OpenAI-compatible).
-# Works with Groq (gsk_... key), xAI/Grok (xai_... key), or any OpenAI-compatible provider.
-# Groq: base_url=https://api.groq.com/openai/v1, model=llama-3.3-70b-versatile
-# xAI:  base_url=https://api.x.ai/v1,             model=grok-3-mini
+# Mistral API for recipe generation
+# Ключ: console.mistral.ai → бесплатные модели: open-mistral-nemo, open-mistral-7b
+# Платные (лучше качество): mistral-small-latest, mistral-large-latest
 GROK_API_KEY: str | None = os.environ.get("GROK_API_KEY")
-GROK_BASE_URL: str = os.environ.get("GROK_BASE_URL", "https://api.groq.com/openai/v1")
-GROK_MODEL: str = os.environ.get("GROK_MODEL", "llama-3.3-70b-versatile")
+GROK_MODEL: str = os.environ.get("GROK_MODEL", "mistral-small-latest")
 
 ALLERGEN_KEY_TO_DISH_NAME: dict[str, str] = {
     "dairy":        "Белок коровьего молока",
