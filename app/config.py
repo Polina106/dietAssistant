@@ -6,12 +6,21 @@ MEAL_URL = os.environ.get("MEAL_URL", "http://meal-service:8080")
 MEAL_PLAN_URL = os.environ.get("MEAL_PLAN_URL", "http://meal-plan-service:8080")
 
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "default-service-secret-key")
+KAFKA_ENABLED = os.environ.get("KAFKA_ENABLED", "true").lower() == "true"
 
-# Mistral API for recipe generation
-# Ключ: console.mistral.ai → бесплатные модели: open-mistral-nemo, open-mistral-7b
-# Платные (лучше качество): mistral-small-latest, mistral-large-latest
+KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
+
+TOPIC_GENERATE_COMMAND = os.environ.get("TOPIC_GENERATE_COMMAND", "generate.mealplan.command")
+TOPIC_REPLACE_COMMAND  = os.environ.get("TOPIC_REPLACE_COMMAND",  "replace.mealplan.command")
+TOPIC_JOB_UPDATED      = os.environ.get("TOPIC_JOB_UPDATED",      "job.updated.event")
+
+# LLM API for recipe generation (OpenAI-compatible).
+# Works with Groq (gsk_... key), xAI/Grok (xai_... key), or any OpenAI-compatible provider.
+# Groq: base_url=https://api.groq.com/openai/v1, model=llama-3.3-70b-versatile
+# xAI:  base_url=https://api.x.ai/v1,             model=grok-3-mini
 GROK_API_KEY: str | None = os.environ.get("GROK_API_KEY")
-GROK_MODEL: str = os.environ.get("GROK_MODEL", "mistral-small-latest")
+GROK_BASE_URL: str = os.environ.get("GROK_BASE_URL", "https://api.groq.com/openai/v1")
+GROK_MODEL: str = os.environ.get("GROK_MODEL", "llama-3.3-70b-versatile")
 
 ALLERGEN_KEY_TO_DISH_NAME: dict[str, str] = {
     "dairy":        "Белок коровьего молока",

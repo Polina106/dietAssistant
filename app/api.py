@@ -3,14 +3,14 @@ import logging
 import threading
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import service_client, local_data
 from app.config import GROK_API_KEY, ALLERGEN_DISH_NAMES
 from app.data_loader import load_recipes
-from app.planner import MealPlanner
-from app.recipe_generator import RecipeGenerator
 from app.local_data import GENERATED_RECIPES_PATH
+from app.planner import MealPlanner
+from app.recipe_generator import RecipeGenerator, to_backend_payload
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
@@ -40,6 +40,12 @@ def _get_planner() -> MealPlanner:
         return _planner
 
 
+def _invalidate_planner() -> None:
+    global _planner
+    with _lock:
+        _planner = None
+
+
 def _get_generator() -> RecipeGenerator | None:
     global _generator
     with _lock:
@@ -56,24 +62,17 @@ def _get_generator() -> RecipeGenerator | None:
 
 
 def _resolve_user_dict(user_id: str) -> dict:
-    """
-    Load user profile and convert to planner format.
-    If local users.json exists — uses only it (no external calls).
-    Falls back to user-service only when the local file is absent.
-    """
     if local_data.users_available():
         user = local_data.load_user(user_id)
         if user is None:
             raise ValueError(f"Пользователь {user_id} не найден в users.json")
         return local_data.build_user_dict(user)
 
-    # No local file — use external service
     profile = service_client.get_user_meal_profile(user_id)
     return _build_user_dict_from_profile(profile)
 
 
 def _build_user_dict_from_profile(profile: dict) -> dict:
-    """Convert API profile dict to planner format (used when no local users.json)."""
     from app.config import ALLERGEN_KEY_TO_DISH_NAME, INGREDIENT_KEY_TO_FEATURE
     user: dict = {
         "пассивное_время_мин":        profile.get("passiveCookingTimeMin") or 9999,
@@ -95,95 +94,48 @@ def _build_user_dict_from_profile(profile: dict) -> dict:
     return user
 
 
+def _user_allergen_names(user_dict: dict) -> list[str]:
+    return [name for name in ALLERGEN_DISH_NAMES if user_dict.get(name, 0) == 1]
+
+
 # ------------------------------------------------------------------
 # Request models
 # ------------------------------------------------------------------
 
-class GenerateRequest(BaseModel):
-    userId: str
-    date: str
-
-
 class ReplaceRequest(BaseModel):
-    userId: str
-    mealPlanId: str
-    mealSlot: str
+    userId:        str
+    mealPlanId:    str
+    mealSlot:      str
     currentDishId: int
+
+
+class IngredientChatRequest(BaseModel):
+    """
+    Chat-style request: the user types what they have on hand and the assistant
+    proposes a single recipe. userId is optional — if supplied, allergens from
+    the user's profile are honoured automatically.
+    """
+    ingredients:  list[str]                  = Field(..., min_length=1, description="Что есть у пользователя")
+    mealType:     str                        = "DINNER"
+    userId:       str | None                 = None
+    extraAllergens: list[str]                = Field(default_factory=list, description="Доп. аллергены сверх профиля")
+    persistToCatalog: bool                   = True
 
 
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
-
-@router.post("/meal-plan/generate")
-def generate_meal_plan(req: GenerateRequest):
-    """
-    Generate a daily meal plan for the user.
-    Falls back to AI-generated recipes if the optimizer finds no solution.
-    """
-    try:
-        user_dict = _resolve_user_dict(req.userId)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Пользователь не найден: {e}")
-
-    excluded_ids: list[int] = []
-    if not local_data.users_available():
-        try:
-            excluded_ids = service_client.get_user_dish_ids(req.userId)
-        except Exception:
-            pass
-
-    result = _get_planner().plan_day(user_dict, exclude_recipe_ids=excluded_ids)
-    is_generated = False
-
-    if not result:
-        logger.info("Optimizer found no plan for user %s — trying generation", req.userId)
-        gen = _get_generator()
-        if gen is None:
-            raise HTTPException(status_code=404,
-                                detail="Не удалось подобрать план питания по заданным параметрам")
-        result = gen.generate_meals(user_dict, user_dict["target_calories"])
-        if not result:
-            raise HTTPException(status_code=404,
-                                detail="Не удалось сгенерировать план питания")
-        is_generated = True
-
-    items = [
-        {
-            "mealSlot":    dish["mealType"],
-            "dishId":      int(dish["id"]),
-            "dishName":    dish["title"],
-            "calories":    round(float(dish["calories"]), 2),
-            "isGenerated": is_generated,
-        }
-        for dish in result
-    ]
-
-    if not local_data.users_available():
-        try:
-            service_client.create_meal_plan(req.userId, req.date, items)
-        except Exception as e:
-            if not is_generated:
-                raise HTTPException(status_code=502, detail=f"Не удалось сохранить план: {e}")
-            logger.warning("Backend rejected generated meal plan: %s", e)
-
-    total_cal  = sum(d["calories"] for d in items)
-    target_cal = user_dict["target_calories"]
-    deviation  = round((total_cal / target_cal - 1) * 100, 1) if target_cal else 0
-
-    return {
-        "date":          req.date,
-        "meals":         items,
-        "isGenerated":   is_generated,
-        "totalCalories": round(total_cal, 1),
-        "targetCalories": target_cal,
-        "deviationPct":  deviation,
-    }
-
+# NOTE: meal-plan generation has been moved back to the Kafka consumer
+# (app/consumer.py) — the orchestrator publishes commands to Kafka and
+# the consumer processes them asynchronously. This file only exposes
+# interactive scenarios that genuinely need an HTTP response in real time.
 
 @router.post("/meal-plan/replace")
 def replace_meal(req: ReplaceRequest):
-    """Replace a single dish in an existing meal plan."""
+    """
+    Replace a single dish in an existing meal plan. Kept on HTTP for now because
+    the mobile UX expects a synchronous answer; can later move to Kafka if needed.
+    """
     try:
         user_dict = _resolve_user_dict(req.userId)
     except Exception as e:
@@ -223,9 +175,80 @@ def replace_meal(req: ReplaceRequest):
     }
 
 
+@router.post("/recipes/from-ingredients")
+def generate_from_ingredients(req: IngredientChatRequest):
+    """
+    Chat scenario: user lists what they have, LLM proposes one recipe using
+    those ingredients (plus pantry basics), honouring their allergens.
+
+    If persistToCatalog=True (default), the resulting dish is also POSTed to
+    meal-service so it gets a stable backend id and shows up in /api/v1/dishes
+    for future planner runs.
+    """
+    if req.mealType not in ("BREAKFAST", "LUNCH", "DINNER"):
+        raise HTTPException(status_code=422, detail="mealType must be BREAKFAST, LUNCH or DINNER")
+
+    gen = _get_generator()
+    if gen is None:
+        raise HTTPException(status_code=503,
+                            detail="Генерация недоступна: GROK_API_KEY не задан")
+
+    # Resolve allergens: union(profile, extraAllergens)
+    user_allergens: list[str] = list(req.extraAllergens or [])
+    if req.userId:
+        try:
+            user_dict = _resolve_user_dict(req.userId)
+            user_allergens = sorted(set(user_allergens) | set(_user_allergen_names(user_dict)))
+        except Exception:
+            logger.warning("Failed to load profile for %s — proceeding with extraAllergens only",
+                           req.userId)
+
+    try:
+        recipe = gen.generate_from_ingredients(
+            available_ingredients=req.ingredients,
+            user_allergens=user_allergens,
+            meal_type=req.mealType,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("Ingredient-based generation failed")
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации: {e}")
+
+    persisted_id: int | None = None
+    if req.persistToCatalog:
+        try:
+            created = service_client.create_dish(to_backend_payload(recipe))
+            persisted_id = int(created["id"]) if created.get("id") is not None else None
+            if persisted_id is not None:
+                recipe = {**recipe, "id": persisted_id}
+                _invalidate_planner()
+                logger.info("Persisted chat-generated dish '%s' with backend id %s",
+                            recipe["title"], persisted_id)
+        except Exception:
+            logger.exception("Failed to persist chat-generated dish to meal-service")
+
+    return {
+        "dishId":       recipe.get("id"),
+        "persistedId":  persisted_id,
+        "title":        recipe["title"],
+        "description":  recipe.get("description"),
+        "cuisine":      recipe.get("cuisine"),
+        "mealType":     recipe.get("mealType"),
+        "calories":     recipe.get("calories"),
+        "ingredients":  recipe.get("ingredients", []),
+        "steps":        [s for s in (recipe.get("recipe") or "").split("\n\n") if s.strip()],
+        "allergens":    recipe.get("common_allergens", []),
+        "activeCookingTimeMin":  recipe.get("kitchen_time_in_minutes"),
+        "passiveCookingTimeMin": (recipe.get("ready_in_minutes") or 0)
+                                  - (recipe.get("kitchen_time_in_minutes") or 0),
+        "aiGenerated":  True,
+        "verified":     False,
+    }
+
+
 @router.get("/users")
 def list_users(limit: int = 20, offset: int = 0):
-    """List users from local users.json."""
     if not local_data.users_available():
         raise HTTPException(status_code=404, detail="Локальный файл users.json не найден")
     users = local_data.load_all_users()
@@ -249,7 +272,6 @@ def list_users(limit: int = 20, offset: int = 0):
 
 @router.get("/users/{user_id}")
 def get_user(user_id: str):
-    """Get a single user's profile from local users.json."""
     if not local_data.users_available():
         raise HTTPException(status_code=404, detail="Локальный файл users.json не найден")
     user = local_data.load_user(user_id)
@@ -260,7 +282,7 @@ def get_user(user_id: str):
 
 @router.get("/generated-recipes")
 def list_generated_recipes():
-    """Return all recipes that were generated by AI."""
+    """Local on-disk log of all recipes ever generated by the LLM (audit trail)."""
     if not GENERATED_RECIPES_PATH.exists():
         return {"total": 0, "recipes": []}
     recipes = json.loads(GENERATED_RECIPES_PATH.read_text(encoding="utf-8"))
@@ -268,28 +290,23 @@ def list_generated_recipes():
 
 
 class DatabaseRecipeRequest(BaseModel):
-    mealType: str = "DINNER"
-    targetCalories: float = 500.0
-    count: int = 1
-    excludeAllergens: list[str] = []
-    preferredCuisines: list[str] = []
-    likedIngredients: list[str] = []
+    mealType:            str       = "DINNER"
+    targetCalories:      float     = 500.0
+    count:               int       = 1
+    excludeAllergens:    list[str] = []
+    preferredCuisines:   list[str] = []
+    likedIngredients:    list[str] = []
     dislikedIngredients: list[str] = []
+    persistToCatalog:    bool      = True
 
 
 @router.post("/recipes/generate")
 def generate_recipe_for_database(req: DatabaseRecipeRequest):
     """
-    Generate recipes and add them to the recipe database (generated_recipes.json).
-    The planner cache is refreshed automatically so new recipes are immediately usable.
-
-    mealType: BREAKFAST | LUNCH | DINNER
-    targetCalories: kcal for a 300 g portion
-    count: number of recipes to generate (1–5)
-    excludeAllergens: Russian allergen names to forbid (see GET /allergens)
-    preferredCuisines: Russian cuisine names (азиатская, европейская, …)
-    likedIngredients: product names to prefer
-    dislikedIngredients: product names to avoid
+    Bulk-generate recipes for the catalog (admin scenario).
+    With persistToCatalog=True each recipe is POSTed to meal-service and gets
+    a backend-allocated id; the planner cache is invalidated so the new dishes
+    are picked up on the next request.
     """
     if req.mealType not in ("BREAKFAST", "LUNCH", "DINNER"):
         raise HTTPException(status_code=422,
@@ -321,10 +338,16 @@ def generate_recipe_for_database(req: DatabaseRecipeRequest):
     if not recipes:
         raise HTTPException(status_code=500, detail="Не удалось сгенерировать ни одного рецепта")
 
-    # Invalidate planner so generated recipes are picked up on next request
-    global _planner
-    with _lock:
-        _planner = None
+    if req.persistToCatalog:
+        for r in recipes:
+            try:
+                created = service_client.create_dish(to_backend_payload(r))
+                backend_id = created.get("id")
+                if backend_id is not None:
+                    r["id"] = int(backend_id)
+            except Exception:
+                logger.exception("Failed to persist generated recipe '%s'", r.get("title"))
+        _invalidate_planner()
 
     return {
         "generated": len(recipes),
@@ -334,15 +357,11 @@ def generate_recipe_for_database(req: DatabaseRecipeRequest):
 
 @router.get("/allergens")
 def list_allergens():
-    """Return the list of allergen names accepted by the API."""
     return {"allergens": ALLERGEN_DISH_NAMES}
 
 
 @router.post("/dishes/reload", status_code=200)
 def reload_dishes():
-    """Force reload of the recipe cache (picks up new generated_recipes.json entries)."""
-    global _planner
-    with _lock:
-        _planner = None
+    _invalidate_planner()
     _get_planner()
     return {"status": "reloaded"}

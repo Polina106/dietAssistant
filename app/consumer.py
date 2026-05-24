@@ -4,7 +4,6 @@ import threading
 import time
 
 from kafka import KafkaConsumer, KafkaProducer
-from kafka.errors import NoBrokersAvailable
 
 from app import service_client
 from app.config import (
@@ -15,7 +14,7 @@ from app.config import (
 )
 from app.data_loader import load_recipes
 from app.planner import MealPlanner
-from app.recipe_generator import RecipeGenerator
+from app.recipe_generator import RecipeGenerator, to_backend_payload
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +35,14 @@ def _get_planner() -> MealPlanner:
             _planner = MealPlanner(df)
             logger.info("Planner initialised with %d dishes", len(_dishes_cache))
         return _planner
+
+
+def _invalidate_planner() -> None:
+    """Reset the cached planner so the next request re-fetches the updated catalog."""
+    global _planner, _dishes_cache
+    with _cache_lock:
+        _planner = None
+        _dishes_cache = []
 
 
 def _get_generator() -> RecipeGenerator | None:
@@ -83,6 +90,33 @@ def _publish_job_updated(producer: KafkaProducer, job_id: str, status: str, mess
     logger.info("Published job update: jobId=%s status=%s", job_id, status)
 
 
+def _persist_generated_dishes(recipes: list[dict]) -> list[dict]:
+    """
+    Push each AI-generated recipe to meal-service via the service token.
+    Replaces the local negative id with the id allocated by the backend so that
+    downstream meal-plan items reference a stable, persisted dish.
+    Returns the recipes list with backend-allocated ids in place.
+    """
+    persisted: list[dict] = []
+    for recipe in recipes:
+        try:
+            payload = to_backend_payload(recipe)
+            created = service_client.create_dish(payload)
+            backend_id = created.get("id")
+            if backend_id is not None:
+                recipe = {**recipe, "id": int(backend_id)}
+                logger.info("Persisted AI-generated dish to meal-service: "
+                            "title='%s' backend_id=%s", recipe["title"], backend_id)
+            persisted.append(recipe)
+        except Exception:
+            logger.exception("Failed to persist generated dish '%s' to meal-service",
+                             recipe.get("title"))
+            # Keep the recipe with its local id — the meal-plan-service still gets a usable
+            # (if unstable) reference; manual cleanup may be needed for orphan negative ids.
+            persisted.append(recipe)
+    return persisted
+
+
 def _handle_generate(cmd: dict, producer: KafkaProducer) -> None:
     job_id = cmd["jobId"]
     user_id = cmd["userId"]
@@ -100,7 +134,7 @@ def _handle_generate(cmd: dict, producer: KafkaProducer) -> None:
         is_generated = False
 
         if not result:
-            logger.info("Optimizer found no plan for job %s — trying recipe generation", job_id)
+            logger.info("Optimizer found no plan for job %s — trying LLM fallback", job_id)
             generator = _get_generator()
             if generator is None:
                 _publish_job_updated(producer, job_id, "FAILED",
@@ -112,6 +146,11 @@ def _handle_generate(cmd: dict, producer: KafkaProducer) -> None:
                 _publish_job_updated(producer, job_id, "FAILED",
                                      "Не удалось подобрать и сгенерировать план питания")
                 return
+            # Persist LLM-generated recipes to the catalog so meal-plan items reference
+            # real, durable dish ids. Also invalidate the planner cache so a future
+            # request can pick them up via the regular optimizer path.
+            result = _persist_generated_dishes(result)
+            _invalidate_planner()
             is_generated = True
 
         items = [
@@ -128,23 +167,14 @@ def _handle_generate(cmd: dict, producer: KafkaProducer) -> None:
         target_cal = user_dict["target_calories"]
         deviation = round((total_cal / target_cal - 1) * 100, 1) if target_cal else 0
 
+        service_client.create_meal_plan(user_id, date, items)
+
         if is_generated:
-            # Generated recipes may have negative IDs that the backend might reject.
-            # We try anyway; if it fails we still report success since recipes are saved locally.
-            try:
-                service_client.create_meal_plan(user_id, date, items)
-                msg = (f"План на {date} сгенерирован ИИ: {len(result)} блюда, "
-                       f"{int(total_cal)} ккал (цель {int(target_cal)}, откл. {deviation:+.1f}%). "
-                       f"Рецепты сохранены в generated_recipes.json")
-            except Exception:
-                logger.warning("Could not save generated meal plan to backend (negative IDs); "
-                               "recipes are stored locally in generated_recipes.json")
-                msg = (f"Рецепты на {date} сгенерированы ИИ и сохранены локально: "
-                       f"{len(result)} блюда, {int(total_cal)} ккал "
-                       f"(цель {int(target_cal)}, откл. {deviation:+.1f}%)")
+            msg = (f"План на {date} собран с участием ИИ: {len(result)} блюд(а), "
+                   f"{int(total_cal)} ккал (цель {int(target_cal)}, откл. {deviation:+.1f}%). "
+                   f"Сгенерированные блюда добавлены в каталог.")
         else:
-            service_client.create_meal_plan(user_id, date, items)
-            msg = (f"План на {date} создан: {len(result)} блюда, "
+            msg = (f"План на {date} создан: {len(result)} блюд(а), "
                    f"{int(total_cal)} ккал (цель {int(target_cal)}, откл. {deviation:+.1f}%)")
 
         _publish_job_updated(producer, job_id, "COMPLETED", msg)
@@ -171,14 +201,29 @@ def _handle_replace(cmd: dict, producer: KafkaProducer) -> None:
         if current_dish_id not in exclude_ids:
             exclude_ids.append(current_dish_id)
 
-        # meal_slot matches mealType (BREAKFAST/LUNCH/DINNER)
         planner = _get_planner()
         replacement = planner.find_replacement(user_dict, meal_slot, exclude_ids)
 
+        # If the optimizer-side replacement is unavailable, fall back to LLM generation
+        # and persist the result so the meal-plan ends up referencing a real dish id.
         if replacement is None:
-            _publish_job_updated(producer, job_id, "FAILED",
-                                 f"Не найдена замена для слота {meal_slot}")
-            return
+            logger.info("No replacement found by planner for slot %s — trying LLM fallback",
+                        meal_slot)
+            generator = _get_generator()
+            if generator is None:
+                _publish_job_updated(producer, job_id, "FAILED",
+                                     f"Не найдена замена для слота {meal_slot}")
+                return
+            generated = generator.generate_meals(
+                user_dict, user_dict["target_calories"], meal_types=[meal_slot]
+            )
+            if not generated:
+                _publish_job_updated(producer, job_id, "FAILED",
+                                     f"Не удалось сгенерировать замену для слота {meal_slot}")
+                return
+            generated = _persist_generated_dishes(generated)
+            _invalidate_planner()
+            replacement = generated[0]
 
         service_client.replace_meal_plan_item(
             meal_plan_id=meal_plan_id,

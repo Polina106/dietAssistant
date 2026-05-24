@@ -102,3 +102,23 @@ def replace_meal_plan_item(meal_plan_id: str, slot: str, dish_id: int, dish_name
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def create_dish(payload: dict) -> dict:
+    """
+    POST a new dish into the meal-service catalog under the service token.
+    Used to persist LLM-generated recipes so they receive a stable DB-side id
+    (the backend allocates a unique negative id when payload['id'] is null)
+    and become available to other services through the normal /api/v1/dishes API.
+
+    The caller is responsible for providing payload fields that match
+    CreateDishRequest: title, mealType, calories, ingredients, allergens, recipe etc.
+    """
+    resp = requests.post(
+        f"{MEAL_URL}/api/v1/dishes",
+        json=payload,
+        headers=_auth_header(),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()

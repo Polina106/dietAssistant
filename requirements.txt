@@ -1,4 +1,5 @@
 openai>=1.30.0
+kafka-python
 fastapi==0.133.1
 uvicorn==0.41.0
 pydantic==2.12.5

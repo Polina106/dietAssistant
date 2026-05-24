@@ -63,6 +63,45 @@ _CATEGORY_BY_MEAL = {
 }
 
 
+def to_backend_payload(recipe: dict) -> dict:
+    """
+    Convert an internal recipe record (the dict shape returned by RecipeGenerator)
+    into a payload accepted by POST /api/v1/dishes on meal-service.
+
+    `id` is intentionally None so the backend allocates a unique negative id
+    on its side (id space below zero is reserved for AI-generated dishes).
+    `aiGenerated` is always True; `verified` is always False — only admins
+    flip verified=true after a manual review.
+    """
+    ingredients = recipe.get("ingredients") or []
+    if isinstance(ingredients, list):
+        ingredients_str = [str(i) for i in ingredients]
+    else:
+        ingredients_str = []
+
+    return {
+        "id":           None,
+        "url":          None,
+        "title":        recipe["title"],
+        "description":  recipe.get("description"),
+        "dishImage":    recipe.get("dish_image"),
+        "calories":     recipe.get("calories"),
+        "protein":      recipe.get("protein"),
+        "fat":          recipe.get("fat"),
+        "carbs":        recipe.get("carbs"),
+        "readyIn":      recipe.get("ready_in"),
+        "kitchenTime":  recipe.get("kitchen_time"),
+        "cuisine":      recipe.get("cuisine"),
+        "categoryPath": recipe.get("category_path"),
+        "recipe":       recipe.get("recipe"),
+        "mealType":     recipe.get("mealType", "DINNER"),
+        "allergens":    list(recipe.get("common_allergens") or []),
+        "ingredients":  ingredients_str,
+        "aiGenerated":  True,
+        "verified":     False,
+    }
+
+
 def _minutes_to_ru(minutes: int) -> str:
     """Convert integer minutes to a Russian time string."""
     if minutes <= 0 or minutes >= 9999:
@@ -431,6 +470,147 @@ class RecipeGenerator:
         if not results and last_error is not None:
             raise last_error
         return results
+
+    # ------------------------------------------------------------------
+    # Ingredient-based generation (chat scenario)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ingredient_prompt(
+        available_ingredients: list[str],
+        meal_type: str,
+        user_allergens: list[str],
+    ) -> str:
+        meal_ru = _MEAL_SLOT_RU.get(meal_type, "блюдо")
+        ingredients_str = ", ".join(available_ingredients)
+        allergens_str = ", ".join(user_allergens) if user_allergens else "нет"
+        all_allergens = ", ".join(ALLERGEN_DISH_NAMES)
+
+        return f"""Пользователь хочет приготовить {meal_ru} ИЗ ТЕХ ПРОДУКТОВ, ЧТО У НЕГО ЕСТЬ.
+
+Имеющиеся ингредиенты у пользователя: {ingredients_str}
+Аллергены пользователя (ЗАПРЕЩЕНО использовать): {allergens_str}
+
+Правила:
+- Используй ПРЕИМУЩЕСТВЕННО ингредиенты из списка пользователя.
+- Допустимо добавить базовые продукты, которые есть на кухне почти у всех (соль, перец, масло, вода, лук, чеснок) — но без экзотики.
+- Если из имеющихся ингредиентов невозможно собрать осмысленное блюдо — верни {{"error": "..."}} с пояснением.
+- НИКОГДА не используй заявленные аллергены.
+
+Полный список возможных аллергенов: {all_allergens}
+
+Верни ТОЛЬКО валидный JSON в точно таком формате:
+{{
+  "title": "Название блюда",
+  "description": "Краткое аппетитное описание (1–2 предложения).",
+  "cuisine": "одно из: азиатская|европейская|восточная|славянская|американская|мексиканская",
+  "ingredients": ["200 г куриной грудки", "1 луковица", "2 ст. л. оливкового масла"],
+  "steps": [
+    "Шаг 1: ...",
+    "Шаг 2: ..."
+  ],
+  "nutrition": {{
+    "calories": 180.0,
+    "protein": 18.0,
+    "fat": 8.0,
+    "carbs": 6.0
+  }},
+  "active_cooking_time_min": 20,
+  "passive_cooking_time_min": 10,
+  "common_allergens": ["аллергены из стандартного перечня, которые реально присутствуют в блюде"]
+}}
+
+Обрати внимание: nutrition — значения на 100 г продукта."""
+
+    def generate_from_ingredients(
+        self,
+        available_ingredients: list[str],
+        user_allergens: Optional[list[str]] = None,
+        meal_type: str = "DINNER",
+    ) -> dict:
+        """
+        Generate a recipe constrained to a user-supplied list of ingredients.
+        Used by the interactive chat scenario where the user types what they have on hand.
+        Returns the same record shape as _generate_one (planner-compatible dict).
+        Raises ValueError if the LLM cannot compose a valid recipe.
+        """
+        if not available_ingredients:
+            raise ValueError("Список ингредиентов пуст")
+
+        system = self._system_prompt()
+        prompt = self._ingredient_prompt(
+            available_ingredients=available_ingredients,
+            meal_type=meal_type,
+            user_allergens=user_allergens or [],
+        )
+        logger.info("Generating recipe from ingredients: %s (slot=%s)",
+                    available_ingredients, meal_type)
+
+        raw = self._call_api(system, prompt)
+        data = self._parse_json(raw)
+
+        if isinstance(data, dict) and data.get("error"):
+            raise ValueError(data["error"])
+
+        # Reuse the same record-building path used by _generate_one, but inlined
+        # because we already have parsed data and don't want to re-call the API.
+        nutrition        = data.get("nutrition", {})
+        cal_per_100g     = float(nutrition.get("calories", 200))
+        protein_per_100g = float(nutrition.get("protein",  0))
+        fat_per_100g     = float(nutrition.get("fat",      0))
+        carbs_per_100g   = float(nutrition.get("carbs",    0))
+
+        active_min  = int(data.get("active_cooking_time_min",  0))
+        passive_min = int(data.get("passive_cooking_time_min", 0))
+        total_min   = active_min + passive_min
+
+        ingredients      = data.get("ingredients", [])
+        steps            = data.get("steps", [])
+        common_allergens = data.get("common_allergens", [])
+
+        conflicts = set(user_allergens or []) & set(common_allergens)
+        if conflicts:
+            logger.warning("Generated recipe contains user allergens %s", conflicts)
+
+        category = _CATEGORY_BY_MEAL.get(meal_type, "Вторые блюда")
+        record = {
+            "id":           self._next_id(),
+            "title":        data["title"],
+            "description":  data.get("description", ""),
+            "dish_image":   None,
+            "kbju": {
+                "calories": round(cal_per_100g, 2),
+                "protein":  round(protein_per_100g, 2),
+                "fat":      round(fat_per_100g, 2),
+                "carbs":    round(carbs_per_100g, 2),
+            },
+            "ready_in":    _minutes_to_ru(total_min),
+            "kitchen_time": _minutes_to_ru(active_min),
+            "cuisine":          data.get("cuisine", "европейская"),
+            "breadcrumbs":      ["Рецепты", category],
+            "category_path":    f"Рецепты > {category}",
+            "category_lvl1":    category,
+            "common_allergens": common_allergens,
+            "ingredients":      ingredients,
+            "recipe": "\n\n".join(
+                f"### Шаг {i + 1}\n{step}" for i, step in enumerate(steps)
+            ),
+            "calories": round(cal_per_100g, 2),
+            "protein":  round(protein_per_100g, 2),
+            "fat":      round(fat_per_100g, 2),
+            "carbs":    round(carbs_per_100g, 2),
+            "ready_in_minutes":          total_min,
+            "kitchen_time_in_minutes":   active_min,
+            **_product_flags(ingredients),
+            **_allergen_flags(common_allergens),
+            "mealType":      meal_type,
+            "is_generated":  True,
+            "generated_at":  datetime.datetime.utcnow().isoformat(),
+            "user_allergens": user_allergens or [],
+            "source":        "ingredient_chat",
+        }
+        self._save_recipe(record)
+        return {**record, "calories": round(cal_per_100g * 3, 2)}
 
     def generate_meals(
         self,
